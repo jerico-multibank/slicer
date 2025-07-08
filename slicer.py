@@ -135,37 +135,69 @@ class DataFrameFilter:
         Returns:
             Filtered DataFrame
         """
-        result_df = self.dataframe.copy()
+        # Start with the original dataframe
+        base_df = self.dataframe.copy()
         
-        # Apply AND filters sequentially
-        if and_filters:
+        # If we have both AND and OR filters, we need to handle the logic carefully
+        if and_filters and or_filters:
+            # First apply AND filters
+            and_result = base_df.copy()
+            for column, filter_config in and_filters.items():
+                operator = filter_config.get('operator', '==')
+                value = filter_config.get('value', None)
+                temp_filter = DataFrameFilter(and_result)
+                and_result = temp_filter.single_filter(column, operator, value)
+            
+            # Then apply OR filters to the original dataframe
+            or_conditions = []
+            for column, filter_config in or_filters.items():
+                operator = filter_config.get('operator', '==')
+                value = filter_config.get('value', None)
+                temp_filter = DataFrameFilter(base_df)
+                filtered_df = temp_filter.single_filter(column, operator, value)
+                or_conditions.append(filtered_df.index)
+            
+            # Combine all OR condition indices
+            combined_or_indices = set()
+            for indices in or_conditions:
+                combined_or_indices.update(indices)
+            
+            # Get rows that satisfy OR conditions
+            or_result = base_df[base_df.index.isin(combined_or_indices)]
+            
+            # Final result: intersection of AND results and OR results
+            final_indices = set(and_result.index).intersection(set(or_result.index))
+            result_df = base_df[base_df.index.isin(final_indices)]
+        
+        # If only AND filters
+        elif and_filters:
+            result_df = base_df.copy()
             for column, filter_config in and_filters.items():
                 operator = filter_config.get('operator', '==')
                 value = filter_config.get('value', None)
                 temp_filter = DataFrameFilter(result_df)
                 result_df = temp_filter.single_filter(column, operator, value)
         
-        # Apply OR filters
-        if or_filters:
+        # If only OR filters
+        elif or_filters:
             or_conditions = []
             for column, filter_config in or_filters.items():
                 operator = filter_config.get('operator', '==')
                 value = filter_config.get('value', None)
-                temp_filter = DataFrameFilter(self.dataframe)
+                temp_filter = DataFrameFilter(base_df)
                 filtered_df = temp_filter.single_filter(column, operator, value)
                 or_conditions.append(filtered_df.index)
             
-            if or_conditions:
-                # Combine all OR condition indices
-                combined_indices = set()
-                for indices in or_conditions:
-                    combined_indices.update(indices)
-                
-                # If we have AND filters, intersect with OR results
-                if and_filters:
-                    result_df = result_df[result_df.index.isin(combined_indices)]
-                else:
-                    result_df = self.dataframe[self.dataframe.index.isin(combined_indices)]
+            # Combine all OR condition indices (union of all conditions)
+            combined_or_indices = set()
+            for indices in or_conditions:
+                combined_or_indices.update(indices)
+            
+            result_df = base_df[base_df.index.isin(combined_or_indices)]
+        
+        # If no filters
+        else:
+            result_df = base_df
         
         return result_df
 
