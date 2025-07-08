@@ -1,8 +1,11 @@
 import pandas as pd
 import argparse
 import sys
-from typing import Dict, Any, Optional, Union
+import os
+import glob
+from typing import Dict, Any, Optional, Union, List
 import logging
+from pathlib import Path
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -12,9 +15,9 @@ class DataFrameFilter:
     """A class to handle DataFrame filtering operations with various operators."""
     
     VALID_OPERATORS = {
-        'string': ['==', '!=', 'contains', 'startswith', 'endswith', 'notcontains', 'icontains'],
-        'numeric': ['==', '!=', '<', '<=', '>', '>='],
-        'common': ['==', '!=']
+        'string': ['==', '!=', 'contains', 'startswith', 'endswith', 'notcontains', 'icontains', 'isnull', 'isnotnull'],
+        'numeric': ['==', '!=', '<', '<=', '>', '>=', 'isnull', 'isnotnull'],
+        'common': ['==', '!=', 'isnull', 'isnotnull']
     }
     
     def __init__(self, dataframe: pd.DataFrame):
@@ -60,14 +63,24 @@ class DataFrameFilter:
         Args:
             column_name: Name of the column to filter
             operator: Comparison operator
-            value: Value to compare against
+            value: Value to compare against (ignored for isnull/isnotnull)
             
         Returns:
             Filtered DataFrame
         """
         self._validate_column(column_name)
         
-        # Convert value to appropriate type
+        # For null checks, we don't need to convert the value
+        if operator in ['isnull', 'isnotnull']:
+            try:
+                if operator == 'isnull':
+                    return self.dataframe[self.dataframe[column_name].isnull()]
+                elif operator == 'isnotnull':
+                    return self.dataframe[self.dataframe[column_name].notnull()]
+            except Exception as e:
+                raise ValueError(f"Error applying null filter: {str(e)}")
+        
+        # Convert value to appropriate type for non-null operators
         if isinstance(value, str):
             value = self._convert_value(value, column_name)
         
@@ -128,7 +141,7 @@ class DataFrameFilter:
         if and_filters:
             for column, filter_config in and_filters.items():
                 operator = filter_config.get('operator', '==')
-                value = filter_config['value']
+                value = filter_config.get('value', None)
                 temp_filter = DataFrameFilter(result_df)
                 result_df = temp_filter.single_filter(column, operator, value)
         
@@ -137,7 +150,7 @@ class DataFrameFilter:
             or_conditions = []
             for column, filter_config in or_filters.items():
                 operator = filter_config.get('operator', '==')
-                value = filter_config['value']
+                value = filter_config.get('value', None)
                 temp_filter = DataFrameFilter(self.dataframe)
                 filtered_df = temp_filter.single_filter(column, operator, value)
                 or_conditions.append(filtered_df.index)
@@ -156,12 +169,109 @@ class DataFrameFilter:
         
         return result_df
 
+class MultiDataFrameProcessor:
+    """Class to handle multiple DataFrames with the same filter criteria."""
+    
+    def __init__(self):
+        self.dataframes = {}
+        self.results = {}
+    
+    def add_dataframe(self, name: str, df: pd.DataFrame):
+        """Add a DataFrame to the processor."""
+        self.dataframes[name] = df
+    
+    def load_from_files(self, file_paths: List[str]) -> None:
+        """Load multiple DataFrames from file paths."""
+        for file_path in file_paths:
+            if not os.path.exists(file_path):
+                logger.warning(f"File not found: {file_path}")
+                continue
+            
+            try:
+                df = load_dataframe(file_path)
+                # Use filename without extension as the key
+                name = Path(file_path).stem
+                self.add_dataframe(name, df)
+                logger.info(f"Loaded {name}: {df.shape}")
+            except Exception as e:
+                logger.error(f"Error loading {file_path}: {str(e)}")
+    
+    def apply_filters(self, and_filters: Optional[Dict[str, Dict[str, Any]]] = None, 
+                     or_filters: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, pd.DataFrame]:
+        """Apply the same filters to all DataFrames."""
+        results = {}
+        
+        for name, df in self.dataframes.items():
+            try:
+                logger.info(f"Filtering {name}...")
+                filter_engine = DataFrameFilter(df)
+                filtered_df = filter_engine.filter_dataframe(and_filters, or_filters)
+                results[name] = filtered_df
+                logger.info(f"  {name}: {len(df)} -> {len(filtered_df)} rows")
+            except Exception as e:
+                logger.error(f"Error filtering {name}: {str(e)}")
+                results[name] = pd.DataFrame()  # Empty DataFrame on error
+        
+        self.results = results
+        return results
+    
+    def get_combined_results(self, add_source_column: bool = True) -> pd.DataFrame:
+        """Combine all filtered results into a single DataFrame."""
+        if not self.results:
+            return pd.DataFrame()
+        
+        combined_dfs = []
+        for name, df in self.results.items():
+            if len(df) > 0:
+                if add_source_column:
+                    df_copy = df.copy()
+                    df_copy['_source_file'] = name
+                    combined_dfs.append(df_copy)
+                else:
+                    combined_dfs.append(df)
+        
+        if combined_dfs:
+            return pd.concat(combined_dfs, ignore_index=True)
+        else:
+            return pd.DataFrame()
+    
+    def save_individual_results(self, output_dir: str, format: str = 'xlsx') -> None:
+        """Save each filtered DataFrame to a separate file."""
+        os.makedirs(output_dir, exist_ok=True)
+        
+        for name, df in self.results.items():
+            if len(df) > 0:
+                output_path = os.path.join(output_dir, f"filtered_{name}.{format}")
+                save_dataframe(df, output_path)
+            else:
+                logger.warning(f"No data to save for {name}")
+    
+    def get_summary_report(self) -> pd.DataFrame:
+        """Generate a summary report of filtering results."""
+        summary_data = []
+        
+        for name in self.dataframes.keys():
+            original_count = len(self.dataframes[name])
+            filtered_count = len(self.results.get(name, pd.DataFrame()))
+            reduction_pct = ((original_count - filtered_count) / original_count * 100) if original_count > 0 else 0
+            
+            summary_data.append({
+                'File': name,
+                'Original_Rows': original_count,
+                'Filtered_Rows': filtered_count,
+                'Rows_Removed': original_count - filtered_count,
+                'Reduction_Percent': round(reduction_pct, 2)
+            })
+        
+        return pd.DataFrame(summary_data)
+
 def parse_filter_string(filter_string: str) -> Dict[str, Dict[str, Any]]:
     """
     Parse filter string into structured format.
     
     Format: 'column1:operator1:value1,column2:operator2:value2'
     If no operator specified, defaults to '=='
+    For null checks: 'column:isnull' or 'column:isnotnull' (no value needed)
     """
     filters = {}
     if not filter_string:
@@ -169,14 +279,29 @@ def parse_filter_string(filter_string: str) -> Dict[str, Dict[str, Any]]:
     
     for item in filter_string.split(","):
         parts = item.strip().split(":")
-        if len(parts) == 2:  # column:value (default to ==)
-            column, value = parts
-            filters[column.strip()] = {'operator': '==', 'value': value.strip()}
+        if len(parts) == 2:
+            column, value_or_op = parts
+            column = column.strip()
+            value_or_op = value_or_op.strip()
+            
+            # Check if it's a null operator
+            if value_or_op.lower() in ['isnull', 'isnotnull']:
+                filters[column] = {'operator': value_or_op.lower(), 'value': None}
+            else:
+                # Default to == operator
+                filters[column] = {'operator': '==', 'value': value_or_op}
         elif len(parts) == 3:  # column:operator:value
             column, operator, value = parts
-            filters[column.strip()] = {'operator': operator.strip(), 'value': value.strip()}
+            column = column.strip()
+            operator = operator.strip()
+            
+            # For null operators, ignore the value
+            if operator.lower() in ['isnull', 'isnotnull']:
+                filters[column] = {'operator': operator.lower(), 'value': None}
+            else:
+                filters[column] = {'operator': operator, 'value': value.strip()}
         else:
-            raise ValueError(f"Invalid filter format: {item}. Use 'column:value' or 'column:operator:value'")
+            raise ValueError(f"Invalid filter format: {item}. Use 'column:value', 'column:operator:value', or 'column:isnull'")
     
     return filters
 
@@ -199,7 +324,7 @@ def load_dataframe(file_path: str) -> pd.DataFrame:
                 return pd.read_csv(file_path)
     except Exception as e:
         logger.error(f"Error loading file {file_path}: {str(e)}")
-        sys.exit(1)
+        raise
 
 def save_dataframe(df: pd.DataFrame, file_path: str) -> None:
     """Save DataFrame to various file formats."""
@@ -215,57 +340,122 @@ def save_dataframe(df: pd.DataFrame, file_path: str) -> None:
         else:
             # Default to Excel
             df.to_excel(file_path, index=False)
-        logger.info(f"Filtered data saved to '{file_path}'")
+        logger.info(f"Data saved to '{file_path}'")
     except Exception as e:
         logger.error(f"Error saving file {file_path}: {str(e)}")
-        sys.exit(1)
+        raise
+
+def expand_file_patterns(patterns: List[str]) -> List[str]:
+    """Expand file patterns (wildcards) to actual file paths."""
+    expanded_files = []
+    for pattern in patterns:
+        if '*' in pattern or '?' in pattern:
+            matches = glob.glob(pattern)
+            if matches:
+                expanded_files.extend(matches)
+            else:
+                logger.warning(f"No files found matching pattern: {pattern}")
+        else:
+            expanded_files.append(pattern)
+    return expanded_files
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Filter a DataFrame based on specified conditions.",
+        description="Filter multiple DataFrames with the same conditions.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Simple equality filter
-  python script.py --input_file data.xlsx --and_filters "Name:John,Age:25"
+  # Filter single file
+  python script.py --input_files data.xlsx --and_filters "Age:>:18"
   
-  # Using operators
-  python script.py --input_file data.xlsx --and_filters "Age:>:18,Score:>=:80"
+  # Filter multiple specific files
+  python script.py --input_files data1.xlsx data2.xlsx data3.csv --and_filters "Status:Active"
   
-  # String operations
-  python script.py --input_file data.xlsx --and_filters "Name:contains:John,Email:endswith:.com"
+  # Filter all Excel files in directory
+  python script.py --input_files "*.xlsx" --and_filters "Department:Engineering"
   
-  # Combining AND and OR filters
-  python script.py --input_file data.xlsx --and_filters "Age:>:18" --or_filters "City:New York,City:Los Angeles"
+  # Filter rows where Email is null
+  python script.py --input_files "*.xlsx" --and_filters "Email:isnull"
+  
+  # Filter rows where Phone is not null
+  python script.py --input_files "*.csv" --and_filters "Phone:isnotnull"
+  
+  # Combine null check with other filters
+  python script.py --input_files "*.xlsx" --and_filters "Status:Active,Email:isnotnull"
+  
+  # Filter with pattern and save individually
+  python script.py --input_files "sales_*.xlsx" --and_filters "Revenue:>:10000" --save_individual --output_dir results
+  
+  # Combine all results into one file
+  python script.py --input_files "*.csv" --and_filters "Score:>=:80" --combine_results --output_file top_performers.xlsx
+  
+  # Generate summary report
+  python script.py --input_files "*.xlsx" --and_filters "Active:TRUE" --summary_report
         """
     )
     
-    parser.add_argument("--input_file", type=str, default="BASE.xlsx", 
-                       help="Input file (supports .xlsx, .csv, .json, .parquet)")
+    parser.add_argument("--input_files", nargs='+', required=True,
+                       help="Input files (supports wildcards like *.xlsx, *.csv)")
     parser.add_argument("--and_filters", type=str, 
-                       help="AND filters: 'column1:operator1:value1,column2:operator2:value2'")
+                       help="AND filters: 'column1:operator1:value1,column2:operator2:value2' or 'column:isnull'")
     parser.add_argument("--or_filters", type=str, 
-                       help="OR filters: 'column1:operator1:value1,column2:operator2:value2'")
+                       help="OR filters: 'column1:operator1:value1,column2:operator2:value2' or 'column:isnull'")
+    
+    # Output options
     parser.add_argument("--output_file", type=str, default="filtered_data.xlsx", 
-                       help="Output file (supports .xlsx, .csv, .json, .parquet)")
+                       help="Output file for combined results")
+    parser.add_argument("--output_dir", type=str, default="filtered_results", 
+                       help="Directory for individual result files")
+    parser.add_argument("--output_format", type=str, default="xlsx", 
+                       choices=['xlsx', 'csv', 'json', 'parquet'],
+                       help="Output format for individual files")
+    
+    # Processing options
+    parser.add_argument("--combine_results", action="store_true", 
+                       help="Combine all filtered results into one file")
+    parser.add_argument("--save_individual", action="store_true", 
+                       help="Save each filtered DataFrame to a separate file")
+    parser.add_argument("--add_source_column", action="store_true", default=True,
+                       help="Add source filename column when combining results")
+    
+    # Display options
     parser.add_argument("--show_info", action="store_true", 
-                       help="Show DataFrame info before filtering")
+                       help="Show DataFrame info for each file")
     parser.add_argument("--show_sample", action="store_true", 
                        help="Show sample of filtered data")
+    parser.add_argument("--summary_report", action="store_true", 
+                       help="Generate and display summary report")
     
     args = parser.parse_args()
     
-    # Load DataFrame
-    logger.info(f"Loading data from {args.input_file}")
-    df = load_dataframe(args.input_file)
+    # Expand file patterns
+    file_paths = expand_file_patterns(args.input_files)
     
+    if not file_paths:
+        logger.error("No input files found")
+        sys.exit(1)
+    
+    logger.info(f"Processing {len(file_paths)} files...")
+    
+    # Initialize processor
+    processor = MultiDataFrameProcessor()
+    
+    # Load DataFrames
+    processor.load_from_files(file_paths)
+    
+    if not processor.dataframes:
+        logger.error("No DataFrames loaded successfully")
+        sys.exit(1)
+    
+    # Show info if requested
     if args.show_info:
-        print(f"\nDataFrame Info:")
-        print(f"Shape: {df.shape}")
-        print(f"Columns: {list(df.columns)}")
-        print(f"Data types:\n{df.dtypes}")
-        print(f"\nFirst 5 rows:")
-        print(df.head())
+        for name, df in processor.dataframes.items():
+            print(f"\n=== {name} ===")
+            print(f"Shape: {df.shape}")
+            print(f"Columns: {list(df.columns)}")
+            print(f"Data types:\n{df.dtypes}")
+            print(f"Null counts:\n{df.isnull().sum()}")
+            print(f"First 3 rows:\n{df.head(3)}")
     
     # Parse filters
     and_filters = parse_filter_string(args.and_filters)
@@ -275,24 +465,46 @@ Examples:
         logger.warning("No filters specified. Output will be identical to input.")
     
     # Apply filters
-    filter_engine = DataFrameFilter(df)
-    
     try:
-        filtered_df = filter_engine.filter_dataframe(and_filters, or_filters)
+        results = processor.apply_filters(and_filters, or_filters)
         
-        logger.info(f"Filtering complete. Rows: {len(df)} -> {len(filtered_df)}")
+        # Show sample if requested
+        if args.show_sample:
+            for name, df in results.items():
+                if len(df) > 0:
+                    print(f"\n=== Sample from {name} ===")
+                    print(df.head())
         
-        if args.show_sample and len(filtered_df) > 0:
-            print(f"\nSample of filtered data:")
-            print(filtered_df.head())
-        elif len(filtered_df) == 0:
-            logger.warning("No rows match the specified filters.")
+        # Generate summary report
+        if args.summary_report:
+            summary = processor.get_summary_report()
+            print("\n=== FILTERING SUMMARY ===")
+            print(summary.to_string(index=False))
+            print(f"\nTotal original rows: {summary['Original_Rows'].sum()}")
+            print(f"Total filtered rows: {summary['Filtered_Rows'].sum()}")
+            print(f"Overall reduction: {summary['Rows_Removed'].sum()} rows")
         
-        # Save filtered data
-        save_dataframe(filtered_df, args.output_file)
+        # Save results
+        if args.combine_results:
+            combined_df = processor.get_combined_results(args.add_source_column)
+            if len(combined_df) > 0:
+                save_dataframe(combined_df, args.output_file)
+                logger.info(f"Combined results: {len(combined_df)} total rows")
+            else:
+                logger.warning("No data to combine")
+        
+        if args.save_individual:
+            processor.save_individual_results(args.output_dir, args.output_format)
+        
+        # Default behavior: save combined results if no specific output option chosen
+        if not args.combine_results and not args.save_individual:
+            combined_df = processor.get_combined_results(args.add_source_column)
+            if len(combined_df) > 0:
+                save_dataframe(combined_df, args.output_file)
+                logger.info(f"Combined results saved to {args.output_file}")
         
     except Exception as e:
-        logger.error(f"Error during filtering: {str(e)}")
+        logger.error(f"Error during processing: {str(e)}")
         sys.exit(1)
 
 if __name__ == "__main__":
